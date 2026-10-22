@@ -661,14 +661,23 @@ func DeleteFiles(source, absPath string, isDir bool) error {
 		return fmt.Errorf("refusing to delete source root directory: %s", absPath)
 	}
 
+	metadataKey, err := mutationLockPath(index, absPath)
+	if err != nil {
+		return err
+	}
+	metadata := resourceMetadataHooks()
+	if err = metadata.before(); err != nil {
+		return err
+	}
+	if err = os.RemoveAll(absPath); err != nil {
+		return err
+	}
+	if err = metadata.deleted(metadataKey); err != nil {
+		return err
+	}
+
 	if !index.Config.ResolvedRules.IndexingDisabled {
 		indexPath := index.MakeIndexPath(absPath, isDir).String()
-
-		// Perform the physical deletion
-		err := os.RemoveAll(absPath)
-		if err != nil {
-			return err
-		}
 
 		// Clear cache entries
 		indexing.RealPathCache.Delete(absPath)
@@ -690,7 +699,7 @@ func DeleteFiles(source, absPath string, isDir bool) error {
 	}
 
 	// Indexing disabled, just delete the file
-	return os.RemoveAll(absPath)
+	return nil
 }
 
 func RefreshIndex(source string, path string, isDir bool, recursive bool) error {
@@ -804,16 +813,31 @@ func moveResourceImpl(isSrcDir bool, sourceIndex, destIndex, realsrc, realdst st
 	}
 	defer release()
 
+	oldMetadataKey, err := mutationLockPath(srcIdx, realsrc)
+	if err != nil {
+		return err
+	}
+	newMetadataKey, err := mutationLockPath(dstIdx, realdst)
+	if err != nil {
+		return err
+	}
+	metadata := resourceMetadataHooks()
+	if err = metadata.before(); err != nil {
+		return err
+	}
 	// Prepare paths for index operations
 	srcIndexPath := srcIdx.MakeIndexPath(realsrc, isSrcDir).String()
 	srcParentPath := filepath.Dir(realsrc)
 
 	// Perform the physical move
-	err := fileutils.MoveFile(realsrc, realdst)
+	err = fileutils.MoveFile(realsrc, realdst)
 	if err != nil {
 		return err
 	}
 
+	if err = metadata.moved(oldMetadataKey, newMetadataKey); err != nil {
+		return err
+	}
 	// Handle SOURCE cleanup (treat as deletion)
 	// Run async to avoid blocking the HTTP response
 	if !srcIdx.Config.ResolvedRules.IndexingDisabled {
@@ -886,13 +910,28 @@ func CopyResource(isSrcDir bool, sourceIndex, destIndex, realsrc, realdst string
 	}
 	defer release()
 
+	oldMetadataKey, err := filepath.EvalSymlinks(realsrc)
+	if err != nil {
+		return err
+	}
+	newMetadataKey, err := mutationLockPath(destGuardIndex, realdst)
+	if err != nil {
+		return err
+	}
+	metadata := resourceMetadataHooks()
+	if err = metadata.before(); err != nil {
+		return err
+	}
 	// Perform the physical copy
-	err := fileutils.CopyFile(realsrc, realdst)
+	err = fileutils.CopyFile(realsrc, realdst)
 	if err != nil {
 		logger.Errorf("[COPY] Physical copy failed: %v", err)
 		return err
 	}
 
+	if err = metadata.copied(oldMetadataKey, newMetadataKey); err != nil {
+		return err
+	}
 	// Refresh source (non-recursive, just metadata)
 	srcIdx := indexing.GetIndex(sourceIndex)
 	if srcIdx != nil && !srcIdx.Config.ResolvedRules.IndexingDisabled {
@@ -942,8 +981,21 @@ func WriteDirectory(opts utils.FileOptions) error {
 	}
 	defer release()
 
+	metadataKey, err := mutationLockPath(idx, realPath)
+	if err != nil {
+		return err
+	}
+	metadata := resourceMetadataHooks()
+	if err = metadata.before(); err != nil {
+		return err
+	}
+	newDirectory := true
+	if info, statErr := os.Stat(realPath); statErr == nil {
+		newDirectory = !info.IsDir()
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
 	var stat os.FileInfo
-	var err error
 	// Check if the destination exists and is a file
 	if stat, err = os.Stat(realPath); err == nil && !stat.IsDir() {
 		// If it's a file and we're trying to create a directory, remove the file first
@@ -960,6 +1012,11 @@ func WriteDirectory(opts utils.FileOptions) error {
 		return err
 	}
 
+	if newDirectory {
+		if err = metadata.deleted(metadataKey); err != nil {
+			return err
+		}
+	}
 	// Explicitly set directory permissions to bypass umask
 	err = os.Chmod(realPath, fileutils.PermDir)
 	if err != nil {
@@ -1004,9 +1061,17 @@ func writeFile(source, path string, in io.Reader) error {
 		return lockErr
 	}
 	defer release()
+	metadataKey, err := mutationLockPath(idx, realPath)
+	if err != nil {
+		return err
+	}
+	metadata := resourceMetadataHooks()
+	if err = metadata.before(); err != nil {
+		return err
+	}
 	// Ensure the parent directories exist
 	parentDir := filepath.Dir(realPath)
-	err := os.MkdirAll(parentDir, fileutils.PermDir)
+	err = os.MkdirAll(parentDir, fileutils.PermDir)
 	if err != nil {
 		return err
 	}
@@ -1030,6 +1095,11 @@ func writeFile(source, path string, in io.Reader) error {
 		return err
 	}
 	defer file.Close()
+	if applyDefaultFilePerm {
+		if err = metadata.deleted(metadataKey); err != nil {
+			return err
+		}
+	}
 
 	// Copy the contents from the reader to the file
 	_, err = io.Copy(file, in)
