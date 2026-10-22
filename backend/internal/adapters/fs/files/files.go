@@ -650,6 +650,11 @@ func DeleteFiles(source, absPath string, isDir bool) error {
 	if index == nil {
 		return fmt.Errorf("could not get index: %v ", source)
 	}
+	release, lockErr := acquireMutation(mutationTarget{index, absPath})
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
 	// Safety guard: never allow deletion of the source root directory itself
 	cleanAbs := filepath.Clean(absPath)
 	if cleanAbs == filepath.Clean(index.Path) {
@@ -793,6 +798,12 @@ func moveResourceImpl(isSrcDir bool, sourceIndex, destIndex, realsrc, realdst st
 		return fmt.Errorf("could not get destination index: %v", destIndex)
 	}
 
+	release, lockErr := acquireMutation(mutationTarget{srcIdx, realsrc}, mutationTarget{dstIdx, realdst})
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+
 	// Prepare paths for index operations
 	srcIndexPath := srcIdx.MakeIndexPath(realsrc, isSrcDir).String()
 	srcParentPath := filepath.Dir(realsrc)
@@ -868,6 +879,13 @@ func CopyResource(isSrcDir bool, sourceIndex, destIndex, realsrc, realdst string
 		return err
 	}
 
+	destGuardIndex := indexing.GetIndex(destIndex)
+	release, lockErr := acquireMutation(mutationTarget{destGuardIndex, realdst})
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
+
 	// Perform the physical copy
 	err := fileutils.CopyFile(realsrc, realdst)
 	if err != nil {
@@ -918,6 +936,11 @@ func WriteDirectory(opts utils.FileOptions) error {
 		return fmt.Errorf("could not get index: %v ", opts.Source)
 	}
 	realPath, _, _ := idx.GetRealPath(opts.Path)
+	release, lockErr := acquireMutation(mutationTarget{idx, filepath.Join(idx.Path, opts.Path)})
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
 
 	var stat os.FileInfo
 	var err error
@@ -976,6 +999,11 @@ func writeFile(source, path string, in io.Reader) error {
 	realPath, _, _ := idx.GetRealPath(path)
 	// Strip trailing slash from realPath if it's meant to be a file
 	realPath = strings.TrimRight(realPath, "/")
+	release, lockErr := acquireMutation(mutationTarget{idx, filepath.Join(idx.Path, path)})
+	if lockErr != nil {
+		return lockErr
+	}
+	defer release()
 	// Ensure the parent directories exist
 	parentDir := filepath.Dir(realPath)
 	err := os.MkdirAll(parentDir, fileutils.PermDir)

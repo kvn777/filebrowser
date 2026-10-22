@@ -49,11 +49,11 @@ func (f *fileInfoWrapper) mode() os.FileMode {
 
 // filteredFileSystem wraps a webdav.FileSystem and filters directory listings using FileInfoFaster
 type filteredFileSystem struct {
-	fs         webdav.FileSystem
-	source     string
-	user       *users.User
-	filePerms  users.SourceFilePermissions
-	httpReq    *http.Request
+	fs        webdav.FileSystem
+	source    string
+	user      *users.User
+	filePerms users.SourceFilePermissions
+	httpReq   *http.Request
 	// Cache FileInfoFaster results per path to avoid redundant calls within the same request
 	fileInfoCache map[string]*iteminfo.ExtendedFileInfo
 }
@@ -474,6 +474,13 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *Context) (int, err
 		return http.StatusNotFound, fmt.Errorf("source %s not found", source)
 	}
 
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, "PROPFIND", http.MethodOptions:
+	default:
+		releaseMutation := indexing.LockDAVMutations(idx)
+		defer releaseMutation()
+	}
+
 	// Get the user's scope to determine the WebDAV root directory
 	// Resolve the scope path to get the real filesystem root for WebDAV
 	// This is the root directory that WebDAV will use to resolve relative paths.
@@ -499,10 +506,24 @@ func webDAVHandler(w http.ResponseWriter, r *http.Request, d *Context) (int, err
 		httpReq:   r,
 	}
 
+	conditionalFS := &conditionalDAVFS{FileSystem: filteredFS, request: r, name: strings.TrimPrefix(r.URL.Path, prefix)}
+	w = &conditionalDAVWriter{ResponseWriter: w, fs: conditionalFS}
+	locks := newScopedLockSystem(idx.WebdavLock, scopePath, idx.Path).(*scopedLockSystem)
+	locks.enforceRequest = true
+	locks.requestMethod = r.Method
+	locks.requestSource = strings.TrimPrefix(r.URL.Path, prefix)
+	if destination, parseErr := url.Parse(r.Header.Get("Destination")); parseErr == nil {
+		if destination.Host == "" || destination.Host == r.Host {
+			if rest, ok := strings.CutPrefix(destination.Path, prefix); ok {
+				locks.requestDestination = rest
+			}
+		}
+	}
+	locks.recursiveMutation = r.Method == http.MethodDelete || r.Method == "MOVE" || r.Method == "COPY"
 	wd := &webdav.Handler{
 		Prefix:     prefix,
-		FileSystem: filteredFS,
-		LockSystem: idx.WebdavLock,
+		FileSystem: conditionalFS,
+		LockSystem: locks,
 		Logger: func(req *http.Request, err error) {
 			if err != nil {
 				errStr := err.Error()
@@ -556,7 +577,7 @@ func webDAVMethodPermission(method string, perms users.SourceFilePermissions) (i
 		if !perms.Download || !perms.Create {
 			return http.StatusForbidden, fmt.Errorf("copy permission required")
 		}
-	case "MOVE":
+	case "MOVE", "LOCK", "UNLOCK":
 		if !perms.Modify {
 			return http.StatusForbidden, fmt.Errorf("modify permission required")
 		}
